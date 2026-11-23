@@ -1,0 +1,383 @@
+#!/bin/sh
+# volta -- orderly generation of k-polycirculant graphs
+#
+# Copyright (C) 2026 Steven Van Overberghe
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# The generator (src/volta.cpp) takes its parameter set at compile time, which
+# is where its speed comes from.  This script turns the command line into such
+# a parameter set, compiles a binary for it on first use, keeps that binary in
+# a cache, and runs it.
+
+set -u
+prog=volta
+
+usage() {
+    cat <<'EOF'
+usage: volta ORBITS [options]
+
+Generates the graphs on n = m_0 + ... + m_{k-1} vertices that have an
+automorphism phi whose orbits (cycles) have the lengths m_0, ..., m_{k-1}
+(k-polycirculant graphs), one per class of relabellings that preserve such an
+automorphism.  Isomorphic graphs can still occur more than once; see README.md.
+
+  ORBITS                orbit lengths, comma-separated: at most 6 of them, the
+                        largest at most 64, every length dividing the largest
+                        (e.g. 17, or 8,8,8, or 12,12,4)
+
+Properties of the graphs (any combination):
+  -f, --forbid LIST     no subgraph from LIST, a comma-separated list of
+                          Kr    the complete graph on r vertices
+                          Kr-e  the complete graph on r vertices minus an edge
+                                (K4-e = diamond: no edge in two triangles)
+                          Cl    the cycle of length exactly l
+                        at most one of each kind, e.g. -f K4 or -f K4-e,C5
+  -F, --co-forbid LIST  the same for the complement; -F K5 = no independent
+                        set of 5 vertices, so -f K4 -F K5 gives Ramsey graphs
+  -g, --girth G         girth at least G (no cycle shorter than G)
+  -c, --chi C           chromatic number at most C
+  -d, --mindeg D        minimum degree at least D
+  -D, --maxdeg D        maximum degree at most D
+  -r, --regular D       D-regular
+  -w, --forward         forward checking: propagate the edges and non-edges
+                        that the -f/-F/-g filters force; same output, often
+                        much faster with -F or -g
+
+Output:
+  -6, --graph6          write the graphs to standard output in graph6 format
+                        (the summary then goes to standard error)
+  -o, --output FILE     write the graphs to FILE in graph6 format
+                        Without -6 or -o only the summary is printed.
+  -v, --verbose         a longer summary: the parameters and statistics of the
+                        search, and the graphs counted by number of edge
+                        orbits (orbits of phi on the edges) and of edges
+
+Running:
+  -t, --threads N       worker threads (default 1; 0 = one per CPU)
+  -s, --split D         depth (number of edge orbits) at which the search is
+                        split into tasks for the threads (default 7)
+  -p, --part R/M        run only part R of M (0 <= R < M); the M parts together
+                        produce every graph exactly once (for spreading a long
+                        run over several processes or machines)
+
+Compilation (one binary per parameter set, compiled on first use and cached):
+  -B, --build-only      compile only, and print the path of the binary
+  -n, --dry-run         print the compile and run commands, do nothing
+      --rebuild         compile even if a cached binary exists
+      --clear-cache     remove the cached binaries and exit
+  -h, --help            this text
+  -V, --version         print the version
+
+Environment:
+  CXX          C++20 compiler (default: g++, c++ or clang++, the first found)
+  CXXFLAGS     replaces the default optimisation flags (-O3 -march=native)
+  VOLTA_CACHE  cache directory (default: ${XDG_CACHE_HOME:-~/.cache}/volta)
+
+Examples:
+  volta 5,5                     count the bicirculants on 10 vertices
+  volta 17 -f K4 -F K4          the (4,4)-Ramsey circulants on 17 vertices
+  volta 8,8,8 -r 3 -g 7 -6      cubic graphs of girth >= 7 on 24 vertices
+  volta 6,6,3 -o all.g6 -t 4    every graph for 6,6,3 into all.g6, 4 threads
+  volta 30,30 -f K4 -F K9 -w -p 3/64 -o part3.g6     part 3 of 64 of a run
+EOF
+}
+
+die() {
+    printf '%s: %s\n' "$prog" "$1" >&2
+    [ "${2:-}" = usage ] && printf "Try 'volta --help' for more information.\n" >&2
+    exit 2
+}
+note() { printf '%s: %s\n' "$prog" "$1" >&2; }
+
+# num WHAT VALUE: VALUE must be a whole number (at most 6 digits); prints it
+# without leading zeros.
+num() {
+    case $2 in
+        ''|*[!0-9]*) die "$1 expects a whole number, not '$2'" usage ;;
+    esac
+    [ ${#2} -le 6 ] || die "$1: '$2' is too large"
+    _n=$(printf '%s' "$2" | sed 's/^0*//')
+    printf '%s' "${_n:-0}"
+}
+
+# --- where the sources are ---------------------------------------------------
+self=$0
+while [ -h "$self" ]; do
+    link=$(readlink "$self")
+    case $link in /*) self=$link ;; *) self=$(dirname "$self")/$link ;; esac
+done
+here=$(cd "$(dirname "$self")" && pwd)
+SRC=
+for d in "${VOLTA_SRC:-}" "$here/src" "$here/../share/volta/src"; do
+    if [ -n "$d" ] && [ -f "$d/volta.cpp" ] && [ -f "$d/bitset.h" ]; then
+        SRC=$(cd "$d" && pwd); break
+    fi
+done
+[ -n "$SRC" ] || die "cannot find volta.cpp and bitset.h (set VOLTA_SRC to their directory)"
+VERSION=$(sed -n 's/^#define VOLTA_VERSION "\(.*\)"$/\1/p' "$SRC/volta.cpp")
+
+# --- the command line ----------------------------------------------------------
+ORB=; FORB=; COFORB=; GIRTH=; CHI=; MIND=; MAXD=; REG=
+FWD=0; G6=0; OUT=; VERBOSE=0; THREADS=1; SPLIT=7; PART=
+BUILDONLY=0; DRY=0; REBUILD=0; CLEAR=0
+
+[ $# -gt 0 ] || { usage >&2; exit 2; }
+while [ $# -gt 0 ]; do
+    opt=$1; shift
+    hasarg=0; arg=
+    case $opt in
+        --*=*)          arg=${opt#*=}; opt=${opt%%=*}; hasarg=1 ;;
+        -[fFgcdDrotsp]?*) arg=${opt#-?}; opt=${opt%"$arg"}; hasarg=1 ;;   # -t4, -fK4
+    esac
+    case $opt in
+        -f|--forbid|-F|--co-forbid|-g|--girth|-c|--chi|-d|--mindeg|-D|--maxdeg|\
+        -r|--regular|-o|--output|-t|--threads|-s|--split|-p|--part)
+            if [ $hasarg = 0 ]; then
+                [ $# -gt 0 ] || die "option $opt needs a value" usage
+                arg=$1; shift
+            fi ;;
+        -*)
+            [ $hasarg = 0 ] || die "option $opt takes no value" usage ;;
+    esac
+    case $opt in
+        -f|--forbid)     FORB="$FORB,$arg" ;;
+        -F|--co-forbid)  COFORB="$COFORB,$arg" ;;
+        -g|--girth)      GIRTH=$(num "$opt" "$arg") || exit 2 ;;
+        -c|--chi)        CHI=$(num "$opt" "$arg") || exit 2 ;;
+        -d|--mindeg)     MIND=$(num "$opt" "$arg") || exit 2 ;;
+        -D|--maxdeg)     MAXD=$(num "$opt" "$arg") || exit 2 ;;
+        -r|--regular)    REG=$(num "$opt" "$arg") || exit 2 ;;
+        -w|--forward)    FWD=1 ;;
+        -6|--graph6)     G6=1 ;;
+        -v|--verbose)    VERBOSE=1 ;;
+        -o|--output)     [ -n "$arg" ] || die "option $opt needs a file name" usage
+                         OUT=$arg; G6=1 ;;
+        -t|--threads)    THREADS=$(num "$opt" "$arg") || exit 2 ;;
+        -s|--split)      SPLIT=$(num "$opt" "$arg") || exit 2 ;;
+        -p|--part)       PART=$arg ;;
+        -B|--build-only) BUILDONLY=1 ;;
+        -n|--dry-run)    DRY=1 ;;
+        --rebuild)       REBUILD=1 ;;
+        --clear-cache)   CLEAR=1 ;;
+        -h|--help)       usage; exit 0 ;;
+        -V|--version)    echo "volta $VERSION"; exit 0 ;;
+        -*)              die "unknown option '$opt'" usage ;;
+        *)               [ -z "$ORB" ] || die "more than one ORBITS argument ('$ORB' and '$opt')" usage
+                         ORB=$opt ;;
+    esac
+done
+
+# --- the cache -------------------------------------------------------------------
+if [ -n "${VOLTA_CACHE:-}" ]; then
+    CACHE=$VOLTA_CACHE
+elif [ -n "${XDG_CACHE_HOME:-}" ]; then
+    CACHE=$XDG_CACHE_HOME/volta
+else
+    [ -n "${HOME:-}" ] || die "HOME is not set; set VOLTA_CACHE to a directory for the compiled binaries"
+    CACHE=$HOME/.cache/volta
+fi
+
+if [ $CLEAR = 1 ]; then
+    # Only what volta itself put there: CACHE/<key>/volta-* and the then empty <key> directories.
+    if [ -d "$CACHE" ]; then
+        for d in "$CACHE"/*/; do
+            [ -d "$d" ] || continue
+            rm -f "$d"volta-* 2>/dev/null
+            rmdir "$d" 2>/dev/null
+        done
+        rmdir "$CACHE" 2>/dev/null
+    fi
+    note "cache $CACHE cleared"
+    exit 0
+fi
+
+# --- ORBITS ------------------------------------------------------------------------
+[ -n "$ORB" ] || die "missing ORBITS, the comma-separated orbit lengths (e.g. volta 8,8,8)" usage
+orbs=$(printf '%s' "$ORB" | tr -d ' ')
+case $orbs in
+    ''|*[!0-9,]*|,*|*,|*,,*) die "ORBITS must be a comma-separated list of orbit lengths, e.g. 8,8,8 (not '$ORB')" usage ;;
+esac
+k=0; n=0; m=0; list=
+oldifs=$IFS; IFS=,
+for x in $orbs; do
+    x=$(num "orbit length" "$x") || exit 2
+    [ "$x" -ge 1 ] || die "orbit lengths must be at least 1"
+    k=$((k + 1)); n=$((n + x)); [ "$x" -gt "$m" ] && m=$x
+    list="$list $x"
+done
+IFS=$oldifs
+[ $k -le 6 ] || die "at most 6 orbits are supported (got $k)"
+[ $m -le 64 ] || die "the largest orbit length is at most 64 (got $m)"
+for x in $list; do
+    [ $((m % x)) = 0 ] || die "every orbit length must divide the largest one ($x does not divide $m)"
+done
+sorted=$(for x in $list; do echo "$x"; done | sort -rn | tr '\n' ',' | sed 's/,$//')
+
+# --- the filters ---------------------------------------------------------------------
+# parse_forbid LIST SIDE: sets <SIDE>K, <SIDE>KE, <SIDE>C (SIDE = G or CO).
+GK=; GKE=; GC=; COK=; COKE=; COC=
+parse_forbid() {
+    _list=$1; _side=$2; _opt=$3
+    oldifs=$IFS; IFS=', '
+    for g in $_list; do
+        [ -n "$g" ] || continue
+        case $g in
+            [Kk]*-[Ee]) v=${g#?}; v=${v%-?}; kind=KE; shape="Kr-e"; lo=3 ;;
+            [Kk]*)      v=${g#?};            kind=K;  shape="Kr";   lo=2 ;;
+            [Cc]*)      v=${g#?};            kind=C;  shape="Cl";   lo=3 ;;
+            *) die "$_opt: unknown graph '$g' (expected Kr, Kr-e or Cl, e.g. K4, K4-e, C5)" usage ;;
+        esac
+        case $v in ''|*[!0-9]*) die "$_opt: unknown graph '$g' (expected Kr, Kr-e or Cl, e.g. K4, K4-e, C5)" usage ;; esac
+        v=$(num "$_opt" "$v") || exit 2
+        [ "$v" -ge $lo ] || die "$_opt $g: $shape needs $( [ $kind = C ] && echo l || echo r) >= $lo"
+        [ "$v" -le $n ] || die "$_opt $g: the graphs have only $n vertices"
+        eval "old=\${$_side$kind}"
+        if [ -n "$old" ] && [ "$old" != "$v" ]; then
+            case $kind in
+                C) die "$_opt: only one cycle length per side (--girth forbids every length below g)" ;;
+                *) die "$_opt: only one $shape per side (the smaller r implies the larger)" ;;
+            esac
+        fi
+        eval "$_side$kind=\$v"
+    done
+    IFS=$oldifs
+}
+parse_forbid "$FORB" G "-f"
+parse_forbid "$COFORB" CO "-F"
+
+if [ -n "$GIRTH" ]; then
+    [ "$GIRTH" -ge 3 ] || die "--girth: the girth of a graph is at least 3"
+    [ "$GIRTH" -le $((n + 1)) ] || die "--girth: at most n+1 = $((n + 1)) (the forests)"
+    [ "$GIRTH" -gt 3 ] || GIRTH=                       # every graph has girth >= 3
+fi
+if [ -n "$CHI" ]; then
+    [ "$CHI" -ge 2 ] || die "--chi: at least 2 (the graphs without edges are -f K2)"
+    [ "$CHI" -le 31 ] || die "--chi: at most 31"
+fi
+if [ -n "$REG" ]; then
+    [ -z "$MIND" ] && [ -z "$MAXD" ] || die "--regular cannot be combined with --mindeg/--maxdeg"
+    [ "$REG" -ge 1 ] || die "--regular 0: the graph without edges is -f K2"
+    [ "$REG" -le $((n - 1)) ] || die "--regular: at most n-1 = $((n - 1))"
+fi
+if [ -n "$MIND" ]; then
+    [ "$MIND" -le $((n - 1)) ] || die "--mindeg: at most n-1 = $((n - 1))"
+    [ "$MIND" -gt 0 ] || MIND=                         # no condition
+fi
+if [ -n "$MAXD" ]; then
+    [ "$MAXD" -ge 1 ] || die "--maxdeg 0: the graph without edges is -f K2"
+    [ -z "$MIND" ] || [ "$MIND" -le "$MAXD" ] || die "--mindeg $MIND exceeds --maxdeg $MAXD"
+fi
+if [ $FWD = 1 ] && [ -z "$GK$GKE$GC$COK$COKE$COC$GIRTH" ]; then
+    note "--forward has no effect without -f, -F or -g; ignored"
+    FWD=0
+fi
+[ "$THREADS" -le 4096 ] || die "--threads: at most 4096"
+[ "$SPLIT" -ge 1 ] || die "--split: at least 1"
+if [ -n "$PART" ]; then
+    case $PART in
+        [0-9]*/[0-9]*) ;;
+        *) die "--part expects R/M, e.g. 3/64" usage ;;
+    esac
+    pr=$(num "--part" "${PART%/*}") || exit 2
+    pm=$(num "--part" "${PART#*/}") || exit 2
+    [ "$pm" -ge 1 ] && [ "$pr" -lt "$pm" ] || die "--part R/M needs 0 <= R < M (got $PART)"
+    PART=$pr/$pm
+fi
+
+# --- the parameter set: macros and the binary's name ----------------------------------
+DEFS="-DORBITS=$sorted"
+NAME="volta-$(printf '%s' "$sorted" | tr ',' '-')"
+add() { DEFS="$DEFS -D$1=$2"; NAME="${NAME}_$3"; }
+[ -n "$GK" ]    && add FORBID_CLIQUE   "$GK"    "k$GK"
+[ -n "$GKE" ]   && add FORBID_KME      "$GKE"   "k${GKE}e"
+[ -n "$GC" ]    && add FORBID_CYCLE    "$GC"    "c$GC"
+[ -n "$COK" ]   && add FORBID_COCLIQUE "$COK"   "cok$COK"
+[ -n "$COKE" ]  && add FORBID_COKME    "$COKE"  "cok${COKE}e"
+[ -n "$COC" ]   && add FORBID_COCYCLE  "$COC"   "coc$COC"
+[ -n "$GIRTH" ] && add MINGIRTH        "$GIRTH" "girth$GIRTH"
+[ -n "$CHI" ]   && add MAXCHI          "$CHI"   "chi$CHI"
+[ -n "$REG" ]   && add REGULAR         "$REG"   "reg$REG"
+[ -n "$MIND" ]  && add MINDEG          "$MIND"  "mindeg$MIND"
+[ -n "$MAXD" ]  && add MAXDEG          "$MAXD"  "maxdeg$MAXD"
+[ $FWD = 1 ]    && add FORWARD 1 fwd
+[ $G6 = 1 ]     && add GRAPH6 1 g6
+[ -n "$PART" ]  && add PARTS 1 parts
+
+# --- the compiler ---------------------------------------------------------------------
+CXX=${CXX:-}
+if [ -z "$CXX" ]; then
+    for c in g++ c++ clang++; do
+        if command -v "$c" >/dev/null 2>&1; then CXX=$c; break; fi
+    done
+fi
+[ -n "$CXX" ] || die "no C++ compiler found: install g++ (10 or later) or clang++ (12 or later), or set CXX"
+if [ -n "${CXXFLAGS+x}" ]; then
+    FLAGS=$CXXFLAGS
+else
+    FLAGS="-O3 -march=native"
+    if ! echo 'int main() { return 0; }' | "$CXX" $FLAGS -x c++ - -o /dev/null >/dev/null 2>&1; then
+        FLAGS="-O3 -mcpu=native"
+        echo 'int main() { return 0; }' | "$CXX" $FLAGS -x c++ - -o /dev/null >/dev/null 2>&1 || FLAGS="-O3"
+    fi
+fi
+
+# The binaries are machine code for this compiler and (with -march=native) this
+# CPU, so the cache directory is keyed by both, and by the sources: a shared
+# home directory on several machines, a new compiler or a new version of volta
+# simply gets a directory of its own.
+native_id() {
+    "$CXX" -march=native -Q --help=target 2>/dev/null | grep -E '^ +-m'
+    echo | "$CXX" $FLAGS -### -x c++ -c - -o /dev/null 2>&1 | tr ' ' '\n' \
+        | grep -E -A1 '^"-target-(cpu|feature)"$'
+}
+KEY=$({ echo "$VERSION"; cat "$SRC/volta.cpp" "$SRC/bitset.h"; command -v "$CXX"
+        "$CXX" --version 2>&1 | head -n 1; echo "$FLAGS"; uname -m
+        case " $FLAGS " in *native*) native_id ;; esac; } | cksum | cut -d ' ' -f 1)
+BIN=$CACHE/$KEY/$NAME
+COMPILE="$CXX $FLAGS -std=c++20 -pthread $DEFS $SRC/volta.cpp -o $BIN"
+RUNARGS="-t $THREADS -s $SPLIT${PART:+ -p $PART}"
+[ $VERBOSE = 1 ] && RUNARGS="-v $RUNARGS"
+
+if [ $DRY = 1 ]; then
+    echo "$COMPILE"
+    echo "$BIN $RUNARGS${OUT:+ > $OUT}"
+    exit 0
+fi
+
+if [ $REBUILD = 1 ] || [ ! -x "$BIN" ]; then
+    mkdir -p "$CACHE/$KEY" || die "cannot create the cache directory $CACHE/$KEY (set VOLTA_CACHE)"
+    note "compiling a binary for this parameter set (once; kept in $CACHE) ..."
+    tmp=$BIN.tmp.$$
+    # shellcheck disable=SC2086  # FLAGS and DEFS are word lists
+    if ! "$CXX" $FLAGS -std=c++20 -pthread $DEFS "$SRC/volta.cpp" -o "$tmp" 2> "$tmp.log"; then
+        cat "$tmp.log" >&2
+        rm -f "$tmp" "$tmp.log"
+        die "compilation failed (a C++20 compiler is needed: g++ 10 or later, clang++ 12 or later)"
+    fi
+    rm -f "$tmp.log"
+    mv -f "$tmp" "$BIN" || die "cannot write $BIN"
+fi
+
+if [ $BUILDONLY = 1 ]; then
+    echo "$BIN"
+    exit 0
+fi
+
+# shellcheck disable=SC2086  # RUNARGS is a word list
+if [ -n "$OUT" ]; then
+    exec "$BIN" $RUNARGS > "$OUT"
+else
+    exec "$BIN" $RUNARGS
+fi
